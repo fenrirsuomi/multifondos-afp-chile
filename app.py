@@ -115,6 +115,20 @@ def formato_pesos_clp(valor):
     return f"$ {int(valor):,}".replace(',', '.')
 
 
+def render_chart(fig):
+    """Renderiza un gráfico Plotly con estilo fijo (independiente del tema
+    claro/oscuro/sistema del navegador del visitante)."""
+    fig.update_layout(
+        legend=dict(
+            bgcolor='rgba(255,255,255,0.92)',
+            bordercolor='#d0d0d0',
+            borderwidth=1,
+            font=dict(color='#1a1a1a'),
+        ),
+    )
+    st.plotly_chart(fig, use_container_width=True, theme=None)
+
+
 # ============================================================
 # SIDEBAR: SELECTOR DE FONDO + NAVEGACIÓN
 # ============================================================
@@ -222,7 +236,7 @@ elif pagina == "📈 Evolución Histórica":
             legend_title="AFP", hovermode="x unified", height=600,
         )
         fig.update_yaxes(tickformat=",.0f")
-        st.plotly_chart(fig, use_container_width=True)
+        render_chart(fig)
     else:
         st.warning("Selecciona al menos una AFP.")
 
@@ -258,7 +272,7 @@ elif pagina == "🏆 Ranking Histórico Completo":
         coloraxis_showscale=False, height=500,
     )
     fig.update_traces(textposition='outside')
-    st.plotly_chart(fig, use_container_width=True)
+    render_chart(fig)
     st.dataframe(ranking.set_index('AFP'), use_container_width=True)
 
 # ============================================================
@@ -283,7 +297,7 @@ elif pagina == "🔍 Radiografía por AFP":
     fig.update_yaxes(matches=None)
     fig.update_layout(showlegend=False, height=650, title_font_size=20)
     fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
-    st.plotly_chart(fig, use_container_width=True)
+    render_chart(fig)
 
 # ============================================================
 # 5. COMPETENCIA 2020-2025 (mismas 7 AFP, mismo periodo)
@@ -312,7 +326,7 @@ elif pagina == "🥊 Competencia 2020–2025":
         coloraxis_showscale=False, height=450,
     )
     fig.update_traces(textposition='outside')
-    st.plotly_chart(fig, use_container_width=True)
+    render_chart(fig)
     st.dataframe(ranking.set_index('AFP'), use_container_width=True)
 
     csv = ranking.to_csv(index=False).encode('utf-8')
@@ -341,7 +355,7 @@ elif pagina == "🌡️ Heatmap Anual":
     )
     fig.update_layout(height=500, template='plotly_white')
     fig.update_xaxes(type='category')
-    st.plotly_chart(fig, use_container_width=True)
+    render_chart(fig)
 
 # ============================================================
 # 7. DRAWDOWN
@@ -371,7 +385,7 @@ elif pagina == "📉 Drawdown":
         yaxis_title="Caída (%)", xaxis_title="Año",
         template='plotly_white', height=600, hovermode="x unified",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    render_chart(fig)
 
 # ============================================================
 # 8. ESCALA LOGARÍTMICA
@@ -398,7 +412,7 @@ elif pagina == "📐 Escala Logarítmica":
         title=f'Evolución Valor Cuota Fondo {fondo_actual} Nominal (Escala Logarítmica)',
         xaxis_title="Fecha", template='plotly_white', height=600, hovermode="x unified",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    render_chart(fig)
 
 # ============================================================
 # 9. VOLATILIDAD
@@ -430,7 +444,7 @@ elif pagina == "〰️ Volatilidad":
         yaxis_title="Volatilidad (%)", xaxis_title="Fecha",
         template='plotly_white', height=600, hovermode="x unified",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    render_chart(fig)
 
 # ============================================================
 # 10. INTERÉS COMPUESTO (escenario fijo, comparativo entre AFP)
@@ -481,7 +495,7 @@ rentabilidad promedio real de cada AFP en la *era moderna* (2020–2025).
     for _, row in df_sim.iterrows():
         fig.add_annotation(x=row['AFP'], y=row['Monto_Final'], text=f"${row['Monto_Final']/1e6:.1f}M",
                             showarrow=False, yshift=15, font=dict(size=12, color='black'))
-    st.plotly_chart(fig, use_container_width=True)
+    render_chart(fig)
 
     st.markdown("**Promedios 2020–2025 usados para la proyección:**")
     st.dataframe(df_sim[['AFP', 'Rentabilidad_Anual']].round(2).set_index('AFP'), use_container_width=True)
@@ -572,7 +586,7 @@ elif pagina == "🎛️ Simulador Interactivo":
             line=dict(width=3), marker=dict(size=6),
         )
         fig.update_yaxes(tickformat=",.0f", ticksuffix=" M")
-        st.plotly_chart(fig, use_container_width=True)
+        render_chart(fig)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Escenario Pesimista", formato_pesos_clp(val_pes[-1]))
