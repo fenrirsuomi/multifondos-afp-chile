@@ -111,6 +111,71 @@ def rentabilidad_periodo(df, cols, start_date):
     return df_periodo, df_anual, df_rent
 
 
+# ============================================================
+# UF: VALOR CUOTA REAL (AJUSTADO POR INFLACIÓN) + CAGR
+# ============================================================
+@st.cache_data
+def load_uf(path='UF.xlsx'):
+    """UF de cierre de cada año (1980-2025). Resolución anual: es lo máximo
+    disponible porque no se cuenta con el valor UF diario."""
+    df_uf = pd.read_excel(path, skiprows=2)
+    df_uf.columns = ['Año', 'IPC_Anual', 'Valor_UF_Dic']
+    df_uf['Año'] = df_uf['Año'].astype(int)
+    return df_uf[['Año', 'Valor_UF_Dic']]
+
+
+@st.cache_data
+def construir_valor_cuota_real(df, cols, df_uf):
+    """Valor cuota de fin de año, dividido por el valor de la UF de cierre del
+    mismo año. El resultado queda "denominado en UF": una serie comparable en
+    el tiempo sin el efecto de la inflación."""
+    df_anual = df[cols].resample('YE').last().copy()
+    df_anual['Año'] = df_anual.index.year
+    df_cruce = df_anual.merge(df_uf, on='Año', how='left').set_index('Año')
+    df_real = df_cruce[cols].div(df_cruce['Valor_UF_Dic'], axis=0)
+    df_real.index = pd.to_datetime(df_real.index.astype(str) + '-12-31')
+    return df_real
+
+
+@st.cache_data
+def ranking_cagr(df_niveles, cols, start_date=None):
+    """Ranking por CAGR (tasa de crecimiento anual compuesta), no por promedio
+    aritmético de retornos anuales -- el promedio simple sobreestima el
+    crecimiento real cuando hay volatilidad (más aún en fondos como el A).
+    Usa el primer/último dato VÁLIDO de cada AFP por separado, para que cada
+    una se compare dentro de su propio período real de existencia."""
+    base = df_niveles.loc[start_date:] if start_date else df_niveles
+    filas = []
+    for c in cols:
+        if c not in base.columns:
+            continue
+        s = base[c].dropna()
+        if len(s) < 2:
+            continue
+        dias = (s.index.max() - s.index.min()).days
+        anios = dias / 365.25
+        if anios <= 0:
+            continue
+        rend_total = (s.iloc[-1] / s.iloc[0]) - 1
+        cagr = ((1 + rend_total) ** (1 / anios) - 1) * 100
+        filas.append({
+            'AFP': c,
+            'Rentabilidad Promedio': round(cagr, 2),
+            'Info Periodo': f"{s.index.min().year}-{s.index.max().year} ({anios:.0f} años)",
+        })
+    if not filas:
+        return pd.DataFrame(columns=['AFP', 'Rentabilidad Promedio', 'Info Periodo'])
+    return pd.DataFrame(filas).sort_values('Rentabilidad Promedio', ascending=False)
+
+
+@st.cache_data
+def retornos_anuales_reales(df_real, cols):
+    """Retorno año a año de la serie YA denominada en UF (para el heatmap real).
+    El primer año de cada AFP queda en NaN: solo tenemos el cierre de año en UF,
+    no un precio de entrada intra-año en UF (no hay UF diaria disponible)."""
+    return df_real[cols].pct_change(fill_method=None) * 100
+
+
 def formato_pesos_clp(valor):
     return f"$ {int(valor):,}".replace(',', '.')
 
@@ -150,6 +215,24 @@ todas_las_afps = [c for c in df.columns]
 
 df_anual_hist, df_rent_hist = rentabilidad_anual_historica(df, afps_existentes)
 df_moderna, df_anual_moderna, df_rent_moderna = rentabilidad_periodo(df, afps_existentes, '2020-01-01')
+
+# --- UF y valor cuota real (ajustado por inflación) ---
+DF_UF = load_uf('UF.xlsx')
+df_real = construir_valor_cuota_real(df, afps_existentes, DF_UF)
+
+modo_valor = st.sidebar.radio(
+    "Ver rentabilidad en:",
+    ["Nominal (CAGR)", "Real (ajustado UF)"],
+    help=(
+        "Nominal: en pesos corrientes. Real: el valor cuota se divide por la UF "
+        "de cierre de cada año, para descontar el efecto de la inflación. Ambos "
+        "usan CAGR (tasa de crecimiento anual compuesta), no promedio simple."
+    ),
+)
+es_real = modo_valor.startswith("Real")
+etiqueta_modo = "Real (UF)" if es_real else "Nominal"
+
+st.sidebar.divider()
 
 secciones = [
     "🏠 Introducción",
@@ -222,20 +305,40 @@ elif pagina == "📈 Evolución Histórica":
     )
 
     if seleccion:
-        df_plot = df[seleccion].reset_index().melt(
-            id_vars='Fecha', var_name='AFP', value_name='Valor Cuota'
-        ).dropna()
+        if es_real:
+            cols_real = [c for c in seleccion if c in df_real.columns]
+            if not cols_real:
+                st.warning("Ninguna de las AFP seleccionadas tiene serie real (UF) disponible.")
+                st.stop()
+            df_plot = df_real[cols_real].reset_index().rename(columns={'index': 'Fecha'}).melt(
+                id_vars='Fecha', var_name='AFP', value_name='Valor Cuota'
+            ).dropna()
+            titulo = f'Evolución Histórica Valor Cuota REAL (en UF) — Fondo {fondo_actual}'
+            eje_y = "Valor Cuota (en UF)"
+            fmt_y = ",.4f"
+            st.caption(
+                "📏 Resolución anual: el ajuste por UF solo puede calcularse con el cierre de "
+                "cada año, así que en modo Real se pierde el detalle diario."
+            )
+        else:
+            df_plot = df[seleccion].reset_index().melt(
+                id_vars='Fecha', var_name='AFP', value_name='Valor Cuota'
+            ).dropna()
+            titulo = f'Evolución Histórica Valor Cuota — Fondo {fondo_actual}'
+            eje_y = "Valor Cuota ($ CLP)"
+            fmt_y = ",.0f"
 
         fig = px.line(
             df_plot, x='Fecha', y='Valor Cuota', color='AFP',
-            title=f'Evolución Histórica Valor Cuota — Fondo {fondo_actual}',
-            template='plotly_white',
+            title=titulo, template='plotly_white',
         )
         fig.update_layout(
-            yaxis_title="Valor Cuota ($ CLP)", xaxis_title="Año",
+            yaxis_title=eje_y, xaxis_title="Año",
             legend_title="AFP", hovermode="x unified", height=600,
         )
-        fig.update_yaxes(tickformat=",.0f")
+        fig.update_yaxes(tickformat=fmt_y)
+        if es_real:
+            fig.update_traces(mode='lines+markers')
         render_chart(fig)
     else:
         st.warning("Selecciona al menos una AFP.")
@@ -244,31 +347,34 @@ elif pagina == "📈 Evolución Histórica":
 # 3. RANKING HISTÓRICO COMPLETO (AFP vigentes)
 # ============================================================
 elif pagina == "🏆 Ranking Histórico Completo":
-    st.title(f"🏆 Rentabilidad Nominal Histórica — Fondo {fondo_actual}")
+    st.title(f"🏆 Rentabilidad {etiqueta_modo} Histórica (CAGR) — Fondo {fondo_actual}")
     st.caption("Solo las 7 AFP vigentes actualmente, cada una con su periodo real de operación.")
+    st.caption(
+        "Se usa CAGR (tasa de crecimiento anual compuesta), no el promedio simple de "
+        "retornos anuales — el promedio simple sobreestima el crecimiento real cuando hay "
+        "volatilidad."
+    )
 
-    stats = []
-    for afp in df_rent_hist.columns:
-        data = df_rent_hist[afp].dropna()
-        if not data.empty:
-            stats.append({
-                'AFP': afp,
-                'Rentabilidad Promedio': data.mean(),
-                'Info Periodo': f"{data.index.min().year}-{data.index.max().year} ({data.count()} años)",
-            })
-    ranking = pd.DataFrame(stats).sort_values('Rentabilidad Promedio', ascending=False)
+    if es_real:
+        ranking = ranking_cagr(df_real, afps_existentes, start_date='2003-01-01')
+        titulo = f'Rentabilidad Real (ajustada UF) Histórica — Fondo {fondo_actual}'
+    else:
+        # 2003-01-01: el sistema de multifondos partió en agosto 2002, así que ese
+        # año quedaría incompleto y distorsionaría el CAGR.
+        ranking = ranking_cagr(df, afps_existentes, start_date='2003-01-01')
+        titulo = f'Rentabilidad Nominal Histórica — Fondo {fondo_actual}'
 
     fig = px.bar(
         ranking, x='Rentabilidad Promedio', y='AFP', orientation='h',
         text=ranking['Rentabilidad Promedio'].map(lambda v: f"{v:.2f}%"),
         color='Rentabilidad Promedio', color_continuous_scale='viridis',
         hover_data={'Info Periodo': True, 'Rentabilidad Promedio': ':.2f'},
-        title=f'Rentabilidad Nominal Histórica — Fondo {fondo_actual}',
+        title=titulo,
         template='plotly_white',
     )
     fig.update_layout(
         yaxis={'categoryorder': 'total ascending'},
-        xaxis_title="Rentabilidad Promedio Anual (%)",
+        xaxis_title="Rentabilidad Anualizada Compuesta - CAGR (%)",
         coloraxis_showscale=False, height=500,
     )
     fig.update_traces(textposition='outside')
@@ -306,23 +412,27 @@ elif pagina == "🥊 Competencia 2020–2025":
     st.title(f"🥊 Competencia entre las 7 AFP actuales (2020–2025) — Fondo {fondo_actual}")
     st.markdown(
         "Comparación en igualdad de condiciones: mismo periodo para las 7 AFP que "
-        "conviven en el sistema desde la creación de AFP UNO en 2019."
+        "conviven en el sistema desde la creación de AFP UNO en 2019. "
+        "Se usa CAGR, no promedio simple de retornos anuales."
     )
 
-    ranking = df_rent_moderna.mean().sort_values(ascending=False).reset_index()
-    ranking.columns = ['AFP', 'Rentabilidad Promedio']
-    ranking['Rentabilidad Promedio'] = ranking['Rentabilidad Promedio'].round(2)
+    if es_real:
+        ranking = ranking_cagr(df_real, afps_existentes, start_date='2020-01-01')
+        titulo = f'Rentabilidad Real (UF) Fondo {fondo_actual} — Era Moderna (2020–2025)'
+    else:
+        ranking = ranking_cagr(df, afps_existentes, start_date='2020-01-01')
+        titulo = f'Rentabilidad Nominal Fondo {fondo_actual} — Era Moderna (2020–2025)'
 
     fig = px.bar(
         ranking, x='Rentabilidad Promedio', y='AFP', orientation='h',
         text=ranking['Rentabilidad Promedio'].map(lambda v: f"{v:.2f}%"),
         color='Rentabilidad Promedio', color_continuous_scale='plasma',
-        title=f'Rentabilidad Nominal Fondo {fondo_actual} — Era Moderna (2020–2025)',
+        title=titulo,
         template='plotly_white',
     )
     fig.update_layout(
         yaxis={'categoryorder': 'total ascending'},
-        xaxis_title="Rentabilidad Promedio (%)",
+        xaxis_title="Rentabilidad Anualizada Compuesta - CAGR (%)",
         coloraxis_showscale=False, height=450,
     )
     fig.update_traces(textposition='outside')
@@ -331,17 +441,24 @@ elif pagina == "🥊 Competencia 2020–2025":
 
     csv = ranking.to_csv(index=False).encode('utf-8')
     st.download_button(
-        "⬇️ Descargar ranking (CSV)", csv, f"Ranking_Fondo{fondo_actual}_2020_2025.csv", "text/csv"
+        "⬇️ Descargar ranking (CSV)", csv, f"Ranking_Fondo{fondo_actual}_2020_2025_{etiqueta_modo}.csv", "text/csv"
     )
 
 # ============================================================
 # 6. HEATMAP ANUAL
 # ============================================================
 elif pagina == "🌡️ Heatmap Anual":
-    st.title(f"🌡️ Mapa de Calor — Rentabilidad Nominal Anual — Fondo {fondo_actual}")
+    st.title(f"🌡️ Mapa de Calor — Rentabilidad {etiqueta_modo} Anual — Fondo {fondo_actual}")
     st.caption("Verde = ganancia, rojo = pérdida. Ordenado por antigüedad en el sistema.")
 
-    df_heatmap = df_rent_hist[afps_existentes].copy()
+    if es_real:
+        df_heatmap = retornos_anuales_reales(df_real, afps_existentes).copy()
+        st.caption(
+            "📏 En modo Real, el primer año de cada AFP queda sin dato: solo tenemos el "
+            "cierre de año en UF, no un precio de entrada intra-año en UF."
+        )
+    else:
+        df_heatmap = df_rent_hist[afps_existentes].copy()
     df_heatmap.index = df_heatmap.index.year
     years_of_service = df_heatmap.count()
     sorted_afps = years_of_service.sort_values(ascending=False).index.tolist()
@@ -351,7 +468,7 @@ elif pagina == "🌡️ Heatmap Anual":
         df_heatmap.T, color_continuous_scale='RdYlGn', color_continuous_midpoint=0,
         text_auto='.1f', aspect='auto',
         labels=dict(x="Año", y="AFP", color="Rentabilidad (%)"),
-        title=f'Mapa de Calor — Rentabilidad Nominal Fondo {fondo_actual} (Histórico Completo)',
+        title=f'Mapa de Calor — Rentabilidad {etiqueta_modo} Fondo {fondo_actual} (Histórico Completo)',
     )
     fig.update_layout(height=500, template='plotly_white')
     fig.update_xaxes(type='category')
@@ -398,18 +515,30 @@ elif pagina == "📐 Escala Logarítmica":
         "escala logarítmica muestra la tendencia real de crecimiento compuesto."
     )
 
+    if es_real:
+        base_plot = df_real
+        eje_y = "Valor Cuota (en UF)"
+        titulo = f'Evolución Valor Cuota Fondo {fondo_actual} REAL en UF (Escala Logarítmica)'
+        st.caption("📏 Resolución anual en modo Real (ver nota en Evolución Histórica).")
+    else:
+        base_plot = df
+        eje_y = "Valor Cuota ($) CLP"
+        titulo = f'Evolución Valor Cuota Fondo {fondo_actual} Nominal (Escala Logarítmica)'
+
     fig = go.Figure()
     for afp in afps_existentes:
-        fig.add_trace(go.Scatter(x=df.index, y=df[afp], name=afp, mode='lines'))
+        if afp in base_plot.columns:
+            modo_linea = 'lines+markers' if es_real else 'lines'
+            fig.add_trace(go.Scatter(x=base_plot.index, y=base_plot[afp], name=afp, mode=modo_linea))
 
     fig.add_vrect(x0=CRISIS_SUBPRIME[0], x1=CRISIS_SUBPRIME[1], fillcolor="red", opacity=0.12, line_width=0,
                   annotation_text="Crisis Subprime", annotation_position="top left")
     fig.add_vrect(x0=CRISIS_COVID[0], x1=CRISIS_COVID[1], fillcolor="red", opacity=0.12, line_width=0,
                   annotation_text="COVID-19", annotation_position="top left")
 
-    fig.update_yaxes(type="log", title="Valor Cuota ($) CLP")
+    fig.update_yaxes(type="log", title=eje_y)
     fig.update_layout(
-        title=f'Evolución Valor Cuota Fondo {fondo_actual} Nominal (Escala Logarítmica)',
+        title=titulo,
         xaxis_title="Fecha", template='plotly_white', height=600, hovermode="x unified",
     )
     render_chart(fig)
@@ -454,18 +583,28 @@ elif pagina == "💰 Interés Compuesto (Fijo)":
     st.markdown(
         """
 Para aterrizar los porcentajes a la realidad de un afiliado, se proyecta un escenario
-fijo: un cotizante que aporta **$100.000 mensuales** durante **30 años**, usando la
-rentabilidad promedio real de cada AFP en la *era moderna* (2020–2025).
+fijo: un cotizante que aporta **$100.000 mensuales** durante **30 años**, usando el
+**CAGR** (tasa de crecimiento anual compuesta) de cada AFP en la *era moderna* (2020–2025).
         """
     )
+    if es_real:
+        st.info(
+            "💡 **Modo Real activo:** la tasa usada es el CAGR real (ajustado por UF). "
+            "El monto proyectado queda expresado en **poder adquisitivo de hoy** (UF), "
+            "asumiendo que el aporte mensual también se reajusta con la inflación "
+            "(igual que ocurre con los sueldos reales en la práctica)."
+        )
 
     aporte_mensual = 100_000
     anos = 30
     meses = anos * 12
     inversion_total = aporte_mensual * meses
 
-    promedios_modernos = df_rent_moderna.mean().reset_index()
-    promedios_modernos.columns = ['AFP', 'Rentabilidad_Anual']
+    if es_real:
+        promedios_modernos = ranking_cagr(df_real, afps_existentes, start_date='2020-01-01')
+    else:
+        promedios_modernos = ranking_cagr(df, afps_existentes, start_date='2020-01-01')
+    promedios_modernos = promedios_modernos.rename(columns={'Rentabilidad Promedio': 'Rentabilidad_Anual'})
     df_sim = promedios_modernos[promedios_modernos['AFP'].isin(afps_existentes)].copy()
 
     df_sim['Tasa_Mensual'] = (1 + df_sim['Rentabilidad_Anual'] / 100) ** (1 / 12) - 1
@@ -476,6 +615,7 @@ rentabilidad promedio real de cada AFP en la *era moderna* (2020–2025).
     df_sim['Pct_Ganancia'] = (df_sim['Ganancia'] / df_sim['Monto_Final']) * 100
     df_sim = df_sim.sort_values('Monto_Final', ascending=False)
 
+    sufijo_titulo = " (pesos de hoy)" if es_real else ""
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=df_sim['AFP'], y=df_sim['Aporte'], name=f'Capital Aportado (${int(inversion_total/1e6)}M)',
@@ -483,13 +623,13 @@ rentabilidad promedio real de cada AFP en la *era moderna* (2020–2025).
         text=[f"{p:.0f}%<br>Aporte" for p in df_sim['Pct_Aporte']], textposition='inside',
     ))
     fig.add_trace(go.Bar(
-        x=df_sim['AFP'], y=df_sim['Ganancia'], name='Rentabilidad (Era Moderna)', marker_color='#55a630',
+        x=df_sim['AFP'], y=df_sim['Ganancia'], name=f'Rentabilidad (Era Moderna, {etiqueta_modo})', marker_color='#55a630',
         text=[f"{p:.0f}%<br>Ganancia" for p in df_sim['Pct_Ganancia']], textposition='inside',
     ))
     fig.update_layout(
         barmode='stack',
-        title=f'Proyección a {anos} Años usando Rentabilidad Actual (2020–2025) — Fondo {fondo_actual}<br><sup>Base: Aporte de ${aporte_mensual:,}/mes</sup>',
-        yaxis_title="Monto Acumulado (CLP)", template='plotly_white', height=600,
+        title=f'Proyección a {anos} Años usando CAGR {etiqueta_modo} (2020–2025) — Fondo {fondo_actual}<br><sup>Base: Aporte de ${aporte_mensual:,}/mes{sufijo_titulo}</sup>',
+        yaxis_title=f"Monto Acumulado (CLP{sufijo_titulo})", template='plotly_white', height=600,
     )
     fig.update_yaxes(tickformat=",.0f", ticksuffix=" $")
     for _, row in df_sim.iterrows():
@@ -497,7 +637,7 @@ rentabilidad promedio real de cada AFP en la *era moderna* (2020–2025).
                             showarrow=False, yshift=15, font=dict(size=12, color='black'))
     render_chart(fig)
 
-    st.markdown("**Promedios 2020–2025 usados para la proyección:**")
+    st.markdown(f"**CAGR 2020–2025 usado para la proyección ({etiqueta_modo}):**")
     st.dataframe(df_sim[['AFP', 'Rentabilidad_Anual']].round(2).set_index('AFP'), use_container_width=True)
 
 # ============================================================
@@ -507,11 +647,21 @@ elif pagina == "🎛️ Simulador Interactivo":
     st.title(f"🎛️ Simulador Interactivo: Proyección de Jubilación — Fondo {fondo_actual}")
     st.markdown(
         "Calculadora de interés compuesto con escenarios *optimista / esperado / "
-        "pesimista*, basada en la rentabilidad real 2020–2025 de la AFP elegida."
+        "pesimista*, basada en el CAGR 2020–2025 de la AFP elegida."
     )
+    if es_real:
+        st.info(
+            "💡 **Modo Real activo:** se usa el CAGR real (ajustado por UF). Los montos "
+            "de abajo quedan expresados en **pesos de hoy** (poder adquisitivo constante), "
+            "asumiendo que el aporte mensual también se reajusta con la inflación — no en "
+            "pesos nominales futuros."
+        )
 
-    promedios_modernos = df_rent_moderna.mean().reset_index()
-    promedios_modernos.columns = ['AFP', 'Rentabilidad_Anual']
+    if es_real:
+        promedios_modernos = ranking_cagr(df_real, afps_existentes, start_date='2020-01-01')
+    else:
+        promedios_modernos = ranking_cagr(df, afps_existentes, start_date='2020-01-01')
+    promedios_modernos = promedios_modernos.rename(columns={'Rentabilidad Promedio': 'Rentabilidad_Anual'})
     promedios_modernos = promedios_modernos[promedios_modernos['AFP'].isin(afps_existentes)]
 
     col1, col2 = st.columns([1, 2])
@@ -571,13 +721,14 @@ elif pagina == "🎛️ Simulador Interactivo":
     }
 
     with col2:
+        sufijo_titulo_sim = " · pesos de hoy" if es_real else ""
         fig = px.line(
             df_melt, x='Año', y='Monto_Millones', color='Escenario', markers=True,
             custom_data=['Monto_Real'], color_discrete_map=colores_escenarios,
-            title=f'Calculadora de Interés Compuesto — Proyección {afp_sel} (Fondo {fondo_actual})<br><sup>(Rendimiento Era Moderna: 2020–2025)</sup>',
+            title=f'Calculadora de Interés Compuesto — Proyección {afp_sel} (Fondo {fondo_actual})<br><sup>(CAGR {etiqueta_modo} Era Moderna: 2020–2025{sufijo_titulo_sim})</sup>',
         )
         fig.update_layout(
-            hovermode="x unified", yaxis_title="Monto Acumulado (Millones $ CLP)",
+            hovermode="x unified", yaxis_title=f"Monto Acumulado (Millones $ CLP{sufijo_titulo_sim})",
             xaxis_title="Años de Inversión", legend_title="Escenarios", template='plotly_white',
             height=550,
         )
